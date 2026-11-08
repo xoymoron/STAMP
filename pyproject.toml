@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stamp*"]
+
+[project]
+name = "stamp"
+version = "0.0.1"
+description = "Joint modal, noise and transient percussion reconstruction with temporal SAE control"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "auraloss==0.3.0",
+    "numpy==1.26.4",
+    "PyYAML>=6,<7",
+    "scipy>=1.10,<2",
+    "soundfile>=0.12,<1",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchmetrics==0.11.4",
+    "setuptools>=65,<81",
+    "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+dev = ["ruff==0.17.3", "pytest", "pre-commit"]
+train = [
+    "pytorch-lightning==1.9.5",
+    "lightning-utilities==0.8.0",
+]
+analysis = ["matplotlib>=3.7,<4"]
+
+[project.scripts]
+stamp = "stamp.cli:main"
+
+[tool.setuptools.package-data]
+stamp = ["configs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+required-version = "==0.17.3"
+target-version = "py310"
+line-length = 88
+extend-exclude = [".venv*", "logs", "pytest-of-*"]
+force-exclude = true
+unsafe-fixes = false
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I"]
+# Allow paired iterators with validated matching lengths.
+ignore = ["B905"]

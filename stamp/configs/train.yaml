@@ -1,0 +1,13 @@
+data:
+  meta_file: metadata.json
+  num_workers: 0
+  batch_size: 4
+training:
+  seed: 42
+  devices: 1
+  accelerator: auto
+  accumulate_grad_batches: 8
+  activation_budget_mib: 8192
+  max_epochs: 150
+  lr: 0.0001
+  env_weight: 0.1
