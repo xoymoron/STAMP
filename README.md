@@ -119,7 +119,11 @@ The sampler shuffles by run seed and epoch, then shards across ranks. It keeps
 complete optimizer batches, so a shuffled remainder smaller than one effective
 batch is omitted each epoch. Validation uses fixed per-clip noise and counts
 each clip once. Keep `--split-seed` fixed when varying `--seed`. For CSV-only
-logging, omit the W&B flags.
+logging, omit the W&B flags. With W&B enabled, both models publish the
+first train and validation batches as audition audio at epoch end. The audio
+includes target/reconstruction and the modal, noise and transient branches.
+OG logs train RMS and validation RMS, peak and tail measurements on valid
+waveform samples.
 
 Export paired checkpoints against the same processed WAV tree and evaluate both
 bundles together. Use the matching modal cache for each checkpoint.

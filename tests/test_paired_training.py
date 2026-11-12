@@ -54,8 +54,14 @@ def test_og_validation_noise_is_clip_keyed_and_preserves_the_training_rng():
             super().__init__()
             self.loss_fn = LengthAwareMRSTFTLoss()
 
-        def forward(self, audio, _):
-            return audio + torch.rand_like(audio)
+        def forward(self, audio, _, *, return_branches=False):
+            noise = torch.rand_like(audio)
+            prediction = audio + noise
+            if return_branches:
+                return prediction, [
+                    dict(modal=audio, noise=noise, transient=torch.zeros_like(audio))
+                ]
+            return prediction
 
     task = DrumBlenderOGTask(NoisyModel(), seed=42, run_seed=73, lr=1e-4)
     audio = torch.full((2, 1, 257), 0.5)
@@ -70,7 +76,9 @@ def test_og_validation_noise_is_clip_keyed_and_preserves_the_training_rng():
     assert torch.equal(state, torch.random.get_rng_state())
     assert not torch.equal(first["a"], first["b"])
     for key in first:
-        torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+        torch.testing.assert_close(
+            first[key], second[key], rtol=0, atol=0, equal_nan=True
+        )
 
 
 def test_og_backpropagates_the_configured_mss_on_raw_valid_clips(monkeypatch):
@@ -80,8 +88,18 @@ def test_og_backpropagates_the_configured_mss_on_raw_valid_clips(monkeypatch):
             self.gain = torch.nn.Parameter(torch.tensor(0.7))
             self.loss_fn = LengthAwareMRSTFTLoss()
 
-        def forward(self, audio, *_):
-            return self.gain * audio
+        def forward(self, audio, *args, return_branches=False):
+            prediction = self.gain * audio
+            if return_branches:
+                return prediction, [
+                    dict(
+                        modal=prediction[i : i + 1, :, :length].detach(),
+                        noise=torch.zeros_like(prediction[i : i + 1, :, :length]),
+                        transient=torch.zeros_like(prediction[i : i + 1, :, :length]),
+                    )
+                    for i, length in enumerate(args[1])
+                ]
+            return prediction
 
     model = Baseline()
     task = DrumBlenderOGTask(model, seed=42, run_seed=73, lr=1e-4)
@@ -95,3 +113,92 @@ def test_og_backpropagates_the_configured_mss_on_raw_valid_clips(monkeypatch):
     actual.backward()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(model.gain.grad, expected_gradient)
+
+
+def test_og_epoch_logs_branch_levels_and_wandb_audio(tmp_path):
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import WandbLogger
+    from torch.utils.data import DataLoader
+
+    wandb = pytest.importorskip("wandb")
+
+    class RecordingLogger(WandbLogger):
+        def log_metrics(self, metrics, step=None):
+            recorded.update(metrics)
+            super().log_metrics(metrics, step=step)
+
+        def log_hyperparams(self, params):
+            pass
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.level = torch.nn.Parameter(torch.tensor(0.5))
+            self.loss_fn = LengthAwareMRSTFTLoss()
+
+        def transfer_batch_to_device(self, batch, device, dataloader_idx):
+            return batch
+
+        def forward(
+            self, target, params, lengths=None, frames=None, *, return_branches=False
+        ):
+            modal = self.level * target
+            noise = torch.full_like(target, 0.1)
+            transient = torch.full_like(target, -0.05)
+            result = (modal + transient) + noise
+            if not return_branches:
+                return result
+            sizes = lengths if lengths is not None else [target.shape[-1]]
+            branches = [
+                dict(
+                    modal=modal[i : i + 1, :, :size].detach(),
+                    noise=noise[i : i + 1, :, :size],
+                    transient=transient[i : i + 1, :, :size],
+                )
+                for i, size in enumerate(sizes)
+            ]
+            return result, branches
+
+    recorded = {}
+    logger = RecordingLogger(project="test", offline=True, save_dir=tmp_path)
+    task = DrumBlenderOGTask(Model(), seed=42, run_seed=42, lr=0.0)
+    batch = (
+        (
+            torch.full((1, 1, 4096), 0.4),
+            torch.zeros(1, 3, 1, 1),
+            torch.tensor([4096]),
+            torch.tensor([1]),
+        ),
+        ["hit"],
+    )
+    loader = DataLoader([batch], batch_size=None, num_workers=0)
+    trainer = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_epochs=1,
+        logger=logger,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+        log_every_n_steps=1,
+    )
+    try:
+        trainer.fit(task, train_dataloaders=loader, val_dataloaders=loader)
+    finally:
+        wandb.finish()
+
+    assert (
+        len(list(tmp_path.glob("wandb/offline-run-*/files/media/audio/**/*.wav"))) == 8
+    )
+    assert trainer.global_step == 1
+    for key, value in {
+        "train/modal_rms": 0.2,
+        "train/noise_rms": 0.1,
+        "val_modal_rms": 0.2,
+        "val_transient_peak": 0.05,
+    }.items():
+        assert float(trainer.callback_metrics[key]) == pytest.approx(value)
+    for split in ("train", "val"):
+        for key in ("audio", "audio_modal", "audio_noise", "audio_transient"):
+            assert isinstance(recorded[f"{split}/{key}"], wandb.Audio)

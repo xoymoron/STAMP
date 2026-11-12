@@ -6,13 +6,23 @@ from math import log
 import pytorch_lightning as pl
 import torch
 import torch.distributed as dist
+from pytorch_lightning.loggers import WandbLogger
 from torch.nn import functional as F
 
 from stamp.loss import JointReconstructionLoss, LengthAwareMRSTFTLoss
 from stamp.models.joint_resynthesis import JointResynthesisModel
-from stamp.synths.noise_band import BANDS, BANK_LENGTH
+from stamp.synths.noise_band import BANDS, BANK_LENGTH, SAMPLE_RATE
 
 LOSS_NAMES = ("loss", "spec", "env")
+TAIL_DIAGNOSTICS = (
+    "tail_modal_energy",
+    "tail_noise_energy",
+    "tail_transient_energy",
+    "tail_target_energy",
+    "tail_inner_ts",
+    "tail_correlation",
+    "tail_transient_ratio",
+)
 DIAGNOSTICS = (
     "modal_rms",
     "noise_rms",
@@ -25,13 +35,7 @@ DIAGNOSTICS = (
     "da_p95",
     "df_saturation",
     "da_saturation",
-    "tail_modal_energy",
-    "tail_noise_energy",
-    "tail_transient_energy",
-    "tail_target_energy",
-    "tail_inner_ts",
-    "tail_correlation",
-    "tail_transient_ratio",
+    *TAIL_DIAGNOSTICS,
 )
 
 
@@ -61,6 +65,43 @@ def _weighted_quantiles(value, weight, probs):
         value.numel() - 1
     )
     return torch.where(cumulative[-1] > 0, value[indices], float("nan"))
+
+
+@torch.no_grad()
+def tail_diagnostics(signals):
+    """Measure the modal, noise, transient and target channels after onset."""
+    length = signals.shape[-1]
+    device = signals.device
+    samples = torch.arange(length, device=device)
+    # Detect the target onset only for diagnostics.
+    n_windows = max(1, (length - 128 + 31) // 32 + 1)
+    end = (n_windows - 1) * 32 + 128
+    counts = (length - torch.arange(n_windows, device=device) * 32).clamp_max(128)
+    target_power = F.pad(signals[3].square(), (0, end - length))
+    power = target_power.unfold(0, 128, 32).sum(-1) / counts
+    peak = power.max()
+    onset = (power > peak * 1e-4).int().argmax() * 32
+    tail = (samples >= onset + 4800) & (peak > 0)
+    energy = (signals.square() * tail).sum(-1)
+    inner = (signals[0] * signals[2] * tail).sum()
+    floor = tail.sum() * 1e-12
+    present = tail.any()
+    correlation = torch.where(
+        present & (energy[0] > floor) & (energy[2] > floor),
+        inner / ((energy[0] * energy[2]).sqrt() + floor),
+        float("nan"),
+    )
+    ratio = torch.where(
+        present & (energy[3] > floor), energy[2] / (energy[3] + floor), float("nan")
+    )
+    return torch.cat(
+        (
+            torch.where(present, energy, float("nan")),
+            torch.stack(
+                (torch.where(present, inner, float("nan")), correlation, ratio)
+            ),
+        )
+    )
 
 
 @torch.no_grad()
@@ -106,27 +147,6 @@ def reconstruction_diagnostics(result, target, analysis_extent):
         / total_weight
     )
 
-    # Detect the target onset only for diagnostics.
-    n_windows = max(1, (length - 128 + 31) // 32 + 1)
-    end = (n_windows - 1) * 32 + 128
-    counts = (length - torch.arange(n_windows, device=device) * 32).clamp_max(128)
-    target_power = F.pad(signals[3].square(), (0, end - length))
-    power = target_power.unfold(0, 128, 32).sum(-1) / counts
-    peak = power.max()
-    onset = (power > peak * 1e-4).int().argmax() * 32
-    tail = (samples >= onset + 4800) & (peak > 0)
-    energy = (signals.square() * tail).sum(-1)
-    inner = (signals[0] * signals[2] * tail).sum()
-    floor = tail.sum() * 1e-12
-    present = tail.any()
-    correlation = torch.where(
-        present & (energy[0] > floor) & (energy[2] > floor),
-        inner / ((energy[0] * energy[2]).sqrt() + floor),
-        float("nan"),
-    )
-    ratio = torch.where(
-        present & (energy[3] > floor), energy[2] / (energy[3] + floor), float("nan")
-    )
     envelope = result.noise_amplitudes.flatten()
     return torch.cat(
         (
@@ -134,10 +154,7 @@ def reconstruction_diagnostics(result, target, analysis_extent):
             torch.stack((envelope.mean(), torch.quantile(envelope, 0.95))),
             quantiles,
             saturation,
-            torch.where(present, energy, float("nan")),
-            torch.stack(
-                (torch.where(present, inner, float("nan")), correlation, ratio)
-            ),
+            tail_diagnostics(signals),
         )
     )
 
@@ -178,6 +195,57 @@ class ReconstructionTask(pl.LightningModule):
         super().__init__()
         self.validation_mss = LengthAwareMRSTFTLoss() if log_mss else None
         self.validation_rows = []
+        self.audition = {"train": {}, "val": {}}
+
+    def _audition_logger(self):
+        trainer = self._trainer
+        if trainer is None or not trainer.is_global_zero or trainer.sanity_checking:
+            return None
+        return next(
+            (logger for logger in trainer.loggers if isinstance(logger, WandbLogger)),
+            None,
+        )
+
+    @torch.no_grad()
+    def _capture_audition(self, split, target, reconstruction, branches):
+        signals = {
+            name: signal.detach().flatten().float().cpu()
+            for name, signal in dict(
+                target=target, reconstruction=reconstruction, **branches
+            ).items()
+        }
+        # Use common headroom so playback keeps the level ratios within the clip.
+        headroom = max(1.0, max(float(x.abs().max()) for x in signals.values()) / 0.99)
+        clips = self.audition[split]
+        clips.setdefault("audio", []).extend(
+            (signals["target"] / headroom, signals["reconstruction"] / headroom)
+        )
+        for name in branches:
+            clips.setdefault(f"audio_{name}", []).append(signals[name] / headroom)
+
+    def _log_audition(self, split):
+        clips = self.audition[split]
+        if not clips:
+            return
+        logger = self._audition_logger()
+        if logger is not None:
+            from wandb import Audio
+
+            logger.log_metrics(
+                {
+                    f"{split}/{name}": Audio(
+                        torch.cat(waves).numpy(),
+                        sample_rate=SAMPLE_RATE,
+                        caption=f"{split}/{name}",
+                    )
+                    for name, waves in clips.items()
+                },
+                step=self.global_step,
+            )
+        clips.clear()
+
+    def on_train_epoch_end(self):
+        self._log_audition("train")
 
     def log_training_terms(self, terms, batch_size, batch_idx):
         detached = terms.detach()
@@ -244,6 +312,7 @@ class ReconstructionTask(pl.LightningModule):
             sync_dist=False,
             batch_size=len(rows),
         )
+        self._log_audition("val")
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -326,12 +395,27 @@ class JointResynthesisTask(ReconstructionTask):
         target = audio / result.gain
         return result, target, torch.stack(self.objective(result.waveform, target))
 
+    def _capture_item_audition(self, split, item, result):
+        self._capture_audition(
+            split,
+            item["audio"],
+            result.waveform.detach() * result.gain,
+            {
+                "modal": result.modal_waveform.detach() * result.gain,
+                "noise": result.noise_waveform.detach() * result.gain,
+                "transient": result.transient_waveform.detach() * result.gain,
+            },
+        )
+
     def training_step(self, batch, batch_idx):
         terms = []
+        capture = batch_idx == 0 and self._audition_logger() is not None
         plan = checkpoint_plan(batch, self.hparams.activation_budget_mib)
         for item, recompute in zip(batch, plan):
-            _, _, losses = self._item(item, True, checkpoint_activations=recompute)
+            result, _, losses = self._item(item, True, checkpoint_activations=recompute)
             terms.append(losses)
+            if capture:
+                self._capture_item_audition("train", item, result)
         terms = torch.stack(terms).mean(0)
         return self.log_training_terms(terms, len(batch), batch_idx)
 
@@ -339,8 +423,11 @@ class JointResynthesisTask(ReconstructionTask):
         return self._item(item, False)
 
     def validation_step(self, batch, batch_idx):
+        capture = batch_idx == 0 and self._audition_logger() is not None
         for item in batch:
             result, target, losses = self.evaluate_item(item)
+            if capture:
+                self._capture_item_audition("val", item, result)
             if self.validation_mss is not None:
                 mss = self.validation_mss(
                     result.waveform * result.gain, item["audio"][None]
