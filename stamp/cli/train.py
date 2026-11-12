@@ -200,7 +200,11 @@ def main(argv=None):
     else:
         from stamp.tasks.drumblender_og import DrumBlenderOGTask, load_og_model
 
-        task = DrumBlenderOGTask(load_og_model(args.og_config), **loss_settings)
+        task = DrumBlenderOGTask(
+            load_og_model(args.og_config),
+            env_weight=settings.get("env_weight", 0.1),
+            **loss_settings,
+        )
         provenance["og_config_sha256"] = hashlib.sha256(
             args.og_config.read_bytes()
         ).hexdigest()

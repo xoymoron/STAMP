@@ -13,6 +13,12 @@ from stamp.loss import JointReconstructionLoss, LengthAwareMRSTFTLoss
 from stamp.models.joint_resynthesis import JointResynthesisModel
 from stamp.synths.noise_band import BANDS, BANK_LENGTH, SAMPLE_RATE
 
+BRANCHES = ("modal", "noise", "transient")
+SIGNALS = (*BRANCHES, "recon", "target")
+RMS_NAMES = tuple(f"{name}_rms" for name in SIGNALS)
+PEAK_NAMES = tuple(f"{name}_peak" for name in SIGNALS)
+
+
 LOSS_NAMES = ("loss", "spec", "env")
 TAIL_DIAGNOSTICS = (
     "tail_modal_energy",
@@ -65,6 +71,25 @@ def _weighted_quantiles(value, weight, probs):
         value.numel() - 1
     )
     return torch.where(cumulative[-1] > 0, value[indices], float("nan"))
+
+
+@torch.no_grad()
+def waveform_levels(signals, *, include_peaks=False):
+    rms = torch.stack([signal.square().mean().sqrt() for signal in signals])
+    if not include_peaks:
+        return rms
+    peaks = torch.stack([signal.abs().amax() for signal in signals])
+    return torch.cat((rms, peaks))
+
+
+def resynthesis_signals(result, target):
+    return (
+        result.modal_waveform,
+        result.noise_waveform,
+        result.transient_waveform,
+        result.waveform,
+        target,
+    )
 
 
 @torch.no_grad()
@@ -195,7 +220,7 @@ class ReconstructionTask(pl.LightningModule):
         super().__init__()
         self.validation_mss = LengthAwareMRSTFTLoss() if log_mss else None
         self.validation_rows = []
-        self.audition = {"train": {}, "val": {}}
+        self.audition = {"train": [], "val": []}
 
     def _audition_logger(self):
         trainer = self._trainer
@@ -207,21 +232,12 @@ class ReconstructionTask(pl.LightningModule):
         )
 
     @torch.no_grad()
-    def _capture_audition(self, split, target, reconstruction, branches):
-        signals = {
-            name: signal.detach().flatten().float().cpu()
-            for name, signal in dict(
-                target=target, reconstruction=reconstruction, **branches
-            ).items()
-        }
-        # Use common headroom so playback keeps the level ratios within the clip.
-        headroom = max(1.0, max(float(x.abs().max()) for x in signals.values()) / 0.99)
-        clips = self.audition[split]
-        clips.setdefault("audio", []).extend(
-            (signals["target"] / headroom, signals["reconstruction"] / headroom)
-        )
-        for name in branches:
-            clips.setdefault(f"audio_{name}", []).append(signals[name] / headroom)
+    def _capture_audition(self, split, target, reconstruction):
+        target = target.detach().flatten().float().cpu()
+        reconstruction = reconstruction.detach().flatten().float().cpu()
+        peak = max(float(target.abs().max()), float(reconstruction.abs().max()))
+        headroom = max(1.0, peak / 0.99)
+        self.audition[split].extend((target / headroom, reconstruction / headroom))
 
     def _log_audition(self, split):
         clips = self.audition[split]
@@ -231,14 +247,12 @@ class ReconstructionTask(pl.LightningModule):
         if logger is not None:
             from wandb import Audio
 
+            name = f"{split}/audio"
             logger.log_metrics(
                 {
-                    f"{split}/{name}": Audio(
-                        torch.cat(waves).numpy(),
-                        sample_rate=SAMPLE_RATE,
-                        caption=f"{split}/{name}",
+                    name: Audio(
+                        torch.cat(clips).numpy(), sample_rate=SAMPLE_RATE, caption=name
                     )
-                    for name, waves in clips.items()
                 },
                 step=self.global_step,
             )
@@ -335,9 +349,14 @@ class ReconstructionTask(pl.LightningModule):
 
 
 class JointResynthesisTask(ReconstructionTask):
-    diagnostics = DIAGNOSTICS
+    diagnostics = (*DIAGNOSTICS, *RMS_NAMES[len(BRANCHES) :], *PEAK_NAMES)
     training_step_metrics = ("train/loss_step", "train_spec", "train_env")
-    training_epoch_metrics = ("train/loss_epoch", "train/spec_epoch", "train/env_epoch")
+    training_epoch_metrics = (
+        "train/loss_epoch",
+        "train/spec_epoch",
+        "train/env_epoch",
+        *(f"train/{key}" for key in RMS_NAMES),
+    )
     validation_metrics = ("validation/loss", "val_spec", "val_env")
 
     def __init__(
@@ -397,14 +416,7 @@ class JointResynthesisTask(ReconstructionTask):
 
     def _capture_item_audition(self, split, item, result):
         self._capture_audition(
-            split,
-            item["audio"],
-            result.waveform.detach() * result.gain,
-            {
-                "modal": result.modal_waveform.detach() * result.gain,
-                "noise": result.noise_waveform.detach() * result.gain,
-                "transient": result.transient_waveform.detach() * result.gain,
-            },
+            split, item["audio"], result.waveform.detach() * result.gain
         )
 
     def training_step(self, batch, batch_idx):
@@ -412,8 +424,11 @@ class JointResynthesisTask(ReconstructionTask):
         capture = batch_idx == 0 and self._audition_logger() is not None
         plan = checkpoint_plan(batch, self.hparams.activation_budget_mib)
         for item, recompute in zip(batch, plan):
-            result, _, losses = self._item(item, True, checkpoint_activations=recompute)
-            terms.append(losses)
+            result, target, losses = self._item(
+                item, True, checkpoint_activations=recompute
+            )
+            levels = waveform_levels(resynthesis_signals(result, target))
+            terms.append(torch.cat((losses, levels)))
             if capture:
                 self._capture_item_audition("train", item, result)
         terms = torch.stack(terms).mean(0)
@@ -436,8 +451,14 @@ class JointResynthesisTask(ReconstructionTask):
             diagnostics = reconstruction_diagnostics(
                 result, target, item["analysis_num_samples"]
             )
+            signals = resynthesis_signals(result, target)
+            levels = waveform_levels(signals, include_peaks=True)
+            # The branch RMS values are already included in diagnostics.
             self.validation_rows.append(
-                (item["sample_id"], torch.cat((losses, diagnostics)).detach())
+                (
+                    item["sample_id"],
+                    torch.cat((losses, diagnostics, levels[len(BRANCHES) :])).detach(),
+                )
             )
 
     def on_load_checkpoint(self, checkpoint):

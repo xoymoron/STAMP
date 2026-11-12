@@ -108,22 +108,23 @@ Both runs share the Adam schedule, gradient clipping and CSV/W&B setup. OG
 optimizes its configured auraloss MSS on valid, unnormalized waveforms. The
 variable-length loss crops batch padding and averages independent clip losses.
 STAMP optimizes its peak-normalized spectral and envelope objective.
-`validation/og_mss` and `validation/loss` track the OG and STAMP objectives
-used for scheduling and checkpoint selection. Compare runs with
-`validation/mss`, the same per-clip auraloss MSS measured at the original
-waveform scale. For training, OG records
-`train/mss_epoch` and STAMP records `train/loss_epoch`. The step curves record
-the rank-averaged final microbatch at Lightning's logging interval.
+Both models report the STAMP loss, spectral and envelope terms on
+target-peak-normalized waveforms in the shared train and validation panels.
+OG uses its own MSS for optimization, scheduling and checkpoint selection
+and also reports it under `train/mss_epoch` and `validation/og_mss`.
+`validation/mss` measures per-clip auraloss MSS at the original waveform
+scale for the paired comparison. The step curves record the rank-averaged
+final microbatch at Lightning's logging interval.
 
 The sampler shuffles by run seed and epoch, then shards across ranks. It keeps
 complete optimizer batches, so a shuffled remainder smaller than one effective
 batch is omitted each epoch. Validation uses fixed per-clip noise and counts
 each clip once. Keep `--split-seed` fixed when varying `--seed`. For CSV-only
 logging, omit the W&B flags. With W&B enabled, both models publish the
-first train and validation batches as audition audio at epoch end. The audio
-includes target/reconstruction and the modal, noise and transient branches.
-OG logs train RMS and validation RMS, peak and tail measurements on valid
-waveform samples.
+first train and validation batches as audition audio at epoch end. Each file
+alternates the target and full reconstruction for every clip in the batch.
+Both models log train RMS and validation RMS, peak and tail measurements
+on target-peak-normalized valid waveform samples.
 
 Export paired checkpoints against the same processed WAV tree and evaluate both
 bundles together. Use the matching modal cache for each checkpoint.

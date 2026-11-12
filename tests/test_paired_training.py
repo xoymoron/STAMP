@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from stamp.data.paired import EpochSampler, paired_rows
-from stamp.loss import LengthAwareMRSTFTLoss
+from stamp.loss import JointReconstructionLoss, LengthAwareMRSTFTLoss
 from stamp.tasks.drumblender_og import DrumBlenderOGTask
 
 
@@ -188,17 +188,34 @@ def test_og_epoch_logs_branch_levels_and_wandb_audio(tmp_path):
     finally:
         wandb.finish()
 
-    assert (
-        len(list(tmp_path.glob("wandb/offline-run-*/files/media/audio/**/*.wav"))) == 8
-    )
+    import soundfile as sf
+
+    files = list(tmp_path.glob("wandb/offline-run-*/files/media/audio/**/*.wav"))
+    assert len(files) == 2
+    for path in files:
+        waveform, _ = sf.read(path)
+        assert waveform.shape == (8192,)
+        assert waveform[:4096].mean() == pytest.approx(0.4, abs=1e-4)
+        assert waveform[4096:].mean() == pytest.approx(0.25, abs=1e-4)
     assert trainer.global_step == 1
     for key, value in {
-        "train/modal_rms": 0.2,
-        "train/noise_rms": 0.1,
-        "val_modal_rms": 0.2,
-        "val_transient_peak": 0.05,
+        "train/modal_rms": 0.5,
+        "train/noise_rms": 0.25,
+        "val_modal_rms": 0.5,
+        "val_transient_peak": 0.125,
     }.items():
         assert float(trainer.callback_metrics[key]) == pytest.approx(value)
-    for split in ("train", "val"):
-        for key in ("audio", "audio_modal", "audio_noise", "audio_transient"):
-            assert isinstance(recorded[f"{split}/{key}"], wandb.Audio)
+    target = torch.ones(1, 1, 4096)
+    prediction = torch.full_like(target, 0.625)
+    expected = JointReconstructionLoss()(prediction, target)
+    for key, value in zip(("validation/loss", "val_spec", "val_env"), expected):
+        assert float(trainer.callback_metrics[key]) == pytest.approx(float(value))
+    assert float(trainer.callback_metrics["val_loss"]) == pytest.approx(
+        float(trainer.callback_metrics["validation/og_mss"])
+    )
+    assert {
+        key for key, value in recorded.items() if isinstance(value, wandb.Audio)
+    } == {
+        "train/audio",
+        "val/audio",
+    }

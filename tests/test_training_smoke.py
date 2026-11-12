@@ -39,3 +39,5 @@ def test_one_training_and_validation_batch_on_cpu(tmp_path):
     trainer.fit(task, train_dataloaders=loader, val_dataloaders=loader)
     assert trainer.global_step == 1
     assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert torch.isfinite(trainer.callback_metrics["train/modal_rms"])
+    assert torch.isfinite(trainer.callback_metrics["val_noise_peak"])

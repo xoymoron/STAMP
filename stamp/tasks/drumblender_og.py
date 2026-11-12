@@ -4,26 +4,17 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from stamp.loss import JointReconstructionLoss
 from stamp.tasks.joint_resynthesis import (
+    BRANCHES,
+    PEAK_NAMES,
+    RMS_NAMES,
     TAIL_DIAGNOSTICS,
     ReconstructionTask,
     reconstruction_seed,
     tail_diagnostics,
+    waveform_levels,
 )
-
-BRANCHES = ("modal", "noise", "transient")
-SIGNALS = (*BRANCHES, "recon", "target")
-RMS_NAMES = tuple(f"{name}_rms" for name in SIGNALS)
-PEAK_NAMES = tuple(f"{name}_peak" for name in SIGNALS)
-
-
-@torch.no_grad()
-def waveform_levels(signals, *, include_peaks=False):
-    rms = torch.stack([signal.square().mean().sqrt() for signal in signals])
-    if not include_peaks:
-        return rms
-    peaks = torch.stack([signal.abs().amax() for signal in signals])
-    return torch.cat((rms, peaks))
 
 
 def load_og_model(config_path):
@@ -52,14 +43,43 @@ def collate_og(items):
 
 class DrumBlenderOGTask(ReconstructionTask):
     diagnostics = (*RMS_NAMES, *PEAK_NAMES, *TAIL_DIAGNOSTICS)
-    training_step_metrics = ("train/mss_step",)
-    training_epoch_metrics = ("train/mss_epoch", *(f"train/{key}" for key in RMS_NAMES))
-    validation_metrics = ("validation/og_mss",)
+    training_step_metrics = (
+        "train/mss_step",
+        "train/loss_step",
+        "train_spec",
+        "train_env",
+    )
+    training_epoch_metrics = (
+        "train/mss_epoch",
+        "train/loss_epoch",
+        "train/spec_epoch",
+        "train/env_epoch",
+        *(f"train/{key}" for key in RMS_NAMES),
+    )
+    validation_metrics = ("validation/og_mss", "validation/loss", "val_spec", "val_env")
 
-    def __init__(self, model, *, seed, run_seed, lr):
+    def __init__(self, model, *, seed, run_seed, lr, env_weight=0.1):
         super().__init__(log_mss=True)
         self.save_hyperparameters(ignore=["model"])
         self.model = model
+        self.comparison_loss = JointReconstructionLoss(env_weight)
+
+    @torch.no_grad()
+    def _compare(self, target, prediction, branches, *, validation=False):
+        # Apply the same target gain to the branches, prediction and target as STAMP.
+        gain = target.abs().amax().clamp_min(1e-4)
+        signals = tuple(
+            signal / gain
+            for signal in (*(branches[name] for name in BRANCHES), prediction, target)
+        )
+        terms = torch.stack(self.comparison_loss(signals[-2], signals[-1]))
+        levels = waveform_levels(signals, include_peaks=validation)
+        if validation:
+            tail = tail_diagnostics(
+                torch.cat((*signals[: len(BRANCHES)], signals[-1]), dim=1)[0]
+            )
+            levels = torch.cat((levels, tail))
+        return terms, levels
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         items, ids = batch
@@ -81,15 +101,15 @@ class DrumBlenderOGTask(ReconstructionTask):
             )
         loss = self.model.loss_fn(prediction, audio, lengths=lengths)
         capture = batch_idx == 0 and self._audition_logger() is not None
-        levels = []
+        observations = []
         for i, length in enumerate(lengths.tolist()):
             target = audio[i : i + 1, :, :length]
             recon = prediction[i : i + 1, :, :length].detach()
-            signals = (*(branches[i][name] for name in BRANCHES), recon, target)
-            levels.append(waveform_levels(signals))
+            comparison, levels = self._compare(target, recon, branches[i])
+            observations.append(torch.cat((comparison, levels)))
             if capture:
-                self._capture_audition("train", target, recon, branches[i])
-        terms = torch.cat((loss[None], torch.stack(levels).mean(dim=0)))
+                self._capture_audition("train", target, recon)
+        terms = torch.cat((loss[None], torch.stack(observations).mean(dim=0)))
         return self.log_training_terms(terms, len(audio), batch_idx)
 
     def on_validation_epoch_start(self):
@@ -132,15 +152,10 @@ class DrumBlenderOGTask(ReconstructionTask):
                 target, features, sample_id, return_branches=True
             )
             mss = self.validation_mss(prediction, target)
-            signals = (*(branches[name] for name in BRANCHES), prediction, target)
-            tail = tail_diagnostics(torch.cat((*signals[:3], target), dim=1)[0])
-            values = torch.cat(
-                (
-                    torch.stack((loss, mss)),
-                    waveform_levels(signals, include_peaks=True),
-                    tail,
-                )
+            comparison, levels = self._compare(
+                target, prediction, branches, validation=True
             )
+            values = torch.cat((loss[None], comparison, mss[None], levels))
             self.validation_rows.append((sample_id, values.detach()))
             if capture:
-                self._capture_audition("val", target, prediction, branches)
+                self._capture_audition("val", target, prediction)
