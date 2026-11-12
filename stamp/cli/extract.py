@@ -8,7 +8,6 @@ from time import monotonic, perf_counter
 from typing import Dict, List, Tuple
 
 import torch
-import torchaudio
 from tqdm import tqdm
 
 from stamp.data.modal_stats import (
@@ -16,6 +15,7 @@ from stamp.data.modal_stats import (
     summarize_metadata,
     write_json_atomic,
 )
+from stamp.utils.audio import read_float_wav, write_float_wav
 from stamp.utils.modal_analysis import ANALYZER_VERSION, ModalAnalyzer
 
 
@@ -457,7 +457,7 @@ def main(argv=None):
 
         last = {"source": str(rel), "status": "failed"}
         try:
-            wav, sr = torchaudio.load(str(wav_path))  # [C,T]
+            wav, sr = read_float_wav(wav_path)  # [C,T]
             if wav.ndim != 2:
                 raise ValueError(f"bad wav shape: {tuple(wav.shape)}")
 
@@ -499,7 +499,7 @@ def main(argv=None):
             # save outputs under out_dir
             out_wav = audio_dir / f"{key}.wav"
             out_feat = feat_dir / f"{key}.pt"
-            torchaudio.save(str(out_wav), wav, args.sample_rate)
+            write_float_wav(out_wav, wav, args.sample_rate)
             torch.save(feat, out_feat)
 
             meta_item = {

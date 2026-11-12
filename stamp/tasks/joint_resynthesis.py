@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
-from stamp.loss import JointReconstructionLoss
+from stamp.loss import JointReconstructionLoss, LengthAwareMRSTFTLoss
 from stamp.models.joint_resynthesis import JointResynthesisModel
 from stamp.synths.noise_band import BANDS, BANK_LENGTH
 
@@ -35,16 +35,20 @@ DIAGNOSTICS = (
 )
 
 
-def clip_offsets(sample_id, seed, *, epoch=None, rank=0):
-    """Offsets are reproducible and independent of activation recomputation."""
+def reconstruction_seed(sample_id, seed, *, epoch=None, rank=0):
     key = (
         f"{seed}:validation:{sample_id}"
         if epoch is None
         else f"{seed}:train:{epoch}:{rank}:{sample_id}"
     )
-    number = int.from_bytes(
+    return int.from_bytes(
         hashlib.blake2b(key.encode(), digest_size=8).digest(), "little"
     )
+
+
+def clip_offsets(sample_id, seed, *, epoch=None, rank=0):
+    """Offsets are reproducible and independent of activation recomputation."""
+    number = reconstruction_seed(sample_id, seed, epoch=epoch, rank=rank)
     return torch.randint(
         BANK_LENGTH, (BANDS,), generator=torch.Generator().manual_seed(number)
     )
@@ -167,106 +171,42 @@ def checkpoint_plan(batch, budget_mib):
     return checkpointed
 
 
-class JointResynthesisTask(pl.LightningModule):
-    def __init__(
-        self,
-        bank,
-        bank_sha256,
-        *,
-        seed=42,
-        lr=1e-4,
-        env_weight=0.1,
-        activation_budget_mib=8192,
-    ):
+class ReconstructionTask(pl.LightningModule):
+    diagnostics = ()
+
+    def __init__(self, *, log_mss):
         super().__init__()
-        if activation_budget_mib < 0:
-            raise ValueError("activation_budget_mib must be nonnegative.")
-        self.save_hyperparameters(ignore=["bank"])
-        self.model = JointResynthesisModel(bank)
-        self.objective = JointReconstructionLoss(env_weight)
+        self.validation_mss = LengthAwareMRSTFTLoss() if log_mss else None
         self.validation_rows = []
 
-    def forward(
-        self,
-        audio,
-        modal_params,
-        analysis_num_samples,
-        offsets,
-        *,
-        checkpoint_activations=True,
-    ):
-        return self.model(
-            audio,
-            modal_params,
-            analysis_num_samples,
-            offsets,
-            checkpoint_activations=checkpoint_activations,
-        )
-
-    def _item(self, item, training, *, checkpoint_activations=True):
-        offsets = clip_offsets(
-            item["sample_id"],
-            self.hparams.seed,
-            epoch=self.current_epoch if training else None,
-            rank=self.global_rank,
-        ).to(self.device)
-        audio = item["audio"][None]
-        result = self(
-            audio,
-            item["params"][None],
-            item["analysis_num_samples"],
-            offsets,
-            checkpoint_activations=checkpoint_activations,
-        )
-        target = audio / result.gain
-        return result, target, torch.stack(self.objective(result.waveform, target))
-
-    def training_step(self, batch, batch_idx):
-        terms = []
-        plan = checkpoint_plan(batch, self.hparams.activation_budget_mib)
-        for item, recompute in zip(batch, plan):
-            result, _, losses = self._item(item, True, checkpoint_activations=recompute)
-            terms.append(losses)
-        terms = torch.stack(terms).mean(0)
-        self.log(
-            "train/loss_step",
-            terms[0].detach(),
-            on_step=True,
-            on_epoch=False,
-            batch_size=len(batch),
-        )
-        # Keep a global epoch average without an all-reduce on every microbatch.
-        self.log(
-            "train/loss_epoch",
-            terms[0].detach(),
+    def log_training_terms(self, terms, batch_size, batch_idx):
+        detached = terms.detach()
+        # Lightning emits step metrics after an optimizer update.
+        batch_number = batch_idx + 1
+        if (
+            batch_number % self.trainer.accumulate_grad_batches == 0
+            or batch_number == self.trainer.num_training_batches
+        ):
+            step_terms = self.trainer.strategy.reduce(
+                detached.clone(), reduce_op="mean"
+            )
+            self.log_dict(
+                dict(zip(self.training_step_metrics, step_terms)),
+                on_step=True,
+                on_epoch=False,
+                batch_size=batch_size,
+            )
+        self.log_dict(
+            dict(zip(self.training_epoch_metrics, detached)),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=len(batch),
-        )
-        self.log_dict(
-            dict(zip((f"train_{name}" for name in LOSS_NAMES[1:]), terms[1:].detach())),
-            on_step=True,
-            on_epoch=False,
-            batch_size=len(batch),
+            batch_size=batch_size,
         )
         return terms[0]
 
     def on_validation_epoch_start(self):
         self.validation_rows.clear()
-
-    def evaluate_item(self, item):
-        return self._item(item, False)
-
-    def validation_step(self, batch, batch_idx):
-        for item in batch:
-            result, target, losses = self.evaluate_item(item)
-            diagnostics = reconstruction_diagnostics(
-                result, target, item["analysis_num_samples"]
-            )
-            self.validation_rows.append(
-                (item["sample_id"], torch.cat((losses, diagnostics)).detach())
-            )
 
     def on_validation_epoch_end(self):
         local = []
@@ -281,22 +221,24 @@ class JointResynthesisTask(pl.LightningModule):
             shards = [local]
         rows = unique_validation_rows(shards)
         values = torch.tensor(list(rows.values()))
+        loss_names = self.validation_metrics
+        if self.validation_mss is not None:
+            loss_names += ("validation/mss",)
+        count = len(loss_names)
         mean = torch.cat(
             (
-                values[:, : len(LOSS_NAMES)].mean(dim=0),
-                values[:, len(LOSS_NAMES) :].nanmean(dim=0),
+                values[:, :count].mean(dim=0),
+                values[:, count:].nanmean(dim=0),
             )
         )
         # Keep the monitor key for existing checkpoints and scheduler state.
         self.log("val_loss", mean[0], logger=False, batch_size=len(rows))
         self.log_dict(
-            {
-                "validation/loss": mean[0],
-                **{
-                    f"val_{name}": value
-                    for name, value in zip(LOSS_NAMES[1:] + DIAGNOSTICS, mean[1:])
-                },
-            },
+            dict(
+                zip(
+                    loss_names + tuple(f"val_{name}" for name in self.diagnostics), mean
+                )
+            ),
             on_step=False,
             on_epoch=True,
             sync_dist=False,
@@ -321,6 +263,95 @@ class JointResynthesisTask(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
         }
+
+
+class JointResynthesisTask(ReconstructionTask):
+    diagnostics = DIAGNOSTICS
+    training_step_metrics = ("train/loss_step", "train_spec", "train_env")
+    training_epoch_metrics = ("train/loss_epoch", "train/spec_epoch", "train/env_epoch")
+    validation_metrics = ("validation/loss", "val_spec", "val_env")
+
+    def __init__(
+        self,
+        bank,
+        bank_sha256,
+        *,
+        seed=42,
+        run_seed=None,
+        lr=1e-4,
+        env_weight=0.1,
+        activation_budget_mib=8192,
+        log_mss=False,
+    ):
+        super().__init__(log_mss=log_mss)
+        if activation_budget_mib < 0:
+            raise ValueError("activation_budget_mib must be nonnegative.")
+        self.save_hyperparameters(ignore=["bank"])
+        self.objective = JointReconstructionLoss(env_weight)
+        self.model = JointResynthesisModel(bank)
+
+    def forward(
+        self,
+        audio,
+        modal_params,
+        analysis_num_samples,
+        offsets,
+        *,
+        checkpoint_activations=True,
+    ):
+        return self.model(
+            audio,
+            modal_params,
+            analysis_num_samples,
+            offsets,
+            checkpoint_activations=checkpoint_activations,
+        )
+
+    def _item(self, item, training, *, checkpoint_activations=True):
+        seed = self.hparams.run_seed if training else None
+        offsets = clip_offsets(
+            item["sample_id"],
+            self.hparams.seed if seed is None else seed,
+            epoch=self.current_epoch if training else None,
+            rank=self.global_rank,
+        ).to(self.device)
+        audio = item["audio"][None]
+        result = self(
+            audio,
+            item["params"][None],
+            item["analysis_num_samples"],
+            offsets,
+            checkpoint_activations=checkpoint_activations,
+        )
+        target = audio / result.gain
+        return result, target, torch.stack(self.objective(result.waveform, target))
+
+    def training_step(self, batch, batch_idx):
+        terms = []
+        plan = checkpoint_plan(batch, self.hparams.activation_budget_mib)
+        for item, recompute in zip(batch, plan):
+            _, _, losses = self._item(item, True, checkpoint_activations=recompute)
+            terms.append(losses)
+        terms = torch.stack(terms).mean(0)
+        return self.log_training_terms(terms, len(batch), batch_idx)
+
+    def evaluate_item(self, item):
+        return self._item(item, False)
+
+    def validation_step(self, batch, batch_idx):
+        for item in batch:
+            result, target, losses = self.evaluate_item(item)
+            if self.validation_mss is not None:
+                mss = self.validation_mss(
+                    result.waveform * result.gain, item["audio"][None]
+                )
+                losses = torch.cat((losses, mss[None]))
+            diagnostics = reconstruction_diagnostics(
+                result, target, item["analysis_num_samples"]
+            )
+            self.validation_rows.append(
+                (item["sample_id"], torch.cat((losses, diagnostics)).detach())
+            )
 
     def on_load_checkpoint(self, checkpoint):
         if (

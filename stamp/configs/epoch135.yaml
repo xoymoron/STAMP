@@ -1,0 +1,13 @@
+data:
+  meta_file: metadata.json
+  num_workers: 4
+  batch_size: 4
+training:
+  seed: 20261106
+  devices: 2
+  accelerator: gpu
+  accumulate_grad_batches: 4
+  activation_budget_mib: 8192
+  max_epochs: 150
+  lr: 0.0001
+  env_weight: 0.1

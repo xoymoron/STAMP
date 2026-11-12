@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 import torchaudio
 
@@ -77,33 +78,26 @@ def test_preprocess_audio_file_resample_stereo(tmp_path_factory):
     assert waveform.shape[0] == 1
 
 
-def test_preprocess_audio_file_passes_string_paths_to_torchaudio(tmp_path, monkeypatch):
-    """Keep preprocessing compatible with SoX backends that reject Path objects."""
+def test_preprocess_preserves_float_wav_amplitudes(tmp_path, monkeypatch):
     input_file = tmp_path / "input.wav"
     output_file = tmp_path / "output.wav"
-    calls = {}
+    signal = np.tile(np.array([-1.25, 0.1234567, 1.5], dtype=np.float32), 512)
+    sf.write(input_file, signal, 48000, subtype="FLOAT")
 
-    def fake_load(path):
-        calls["load_path"] = path
-        return torch.ones(1, 512), 16000
+    def save_with_pcm16_default(path, waveform, sample_rate, **kwargs):
+        sf.write(path, waveform.T.numpy(), sample_rate, subtype="PCM_16")
 
-    def fake_save(path, waveform, sample_rate):
-        calls["save_path"] = path
-        calls["waveform"] = waveform
-        calls["sample_rate"] = sample_rate
-
-    monkeypatch.setattr(audio_utils.torchaudio, "load", fake_load)
-    monkeypatch.setattr(audio_utils.torchaudio, "save", fake_save)
-
+    monkeypatch.setattr(torchaudio, "save", save_with_pcm16_default)
     audio_utils.preprocess_audio_file(
         input_file=input_file,
         output_file=output_file,
-        sample_rate=16000,
-        num_samples=512,
+        sample_rate=48000,
     )
 
-    assert calls["load_path"] == str(input_file)
-    assert calls["save_path"] == str(output_file)
+    waveform, rate = sf.read(output_file, dtype="float32")
+    assert sf.info(output_file).subtype == "FLOAT"
+    assert rate == 48000
+    np.testing.assert_array_equal(waveform, signal)
 
 
 def test_preprocess_audio_file_selects_the_channel_with_higher_rms(

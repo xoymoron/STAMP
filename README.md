@@ -48,10 +48,12 @@ stamp extract --processed_root data/processed --out_dir data/modal --num_modes 6
 stamp noise-bank assets/noise_bank_48k.pt
 ```
 
-Preprocessing defaults to mono 48 kHz, a 20-second maximum duration, leading
-silence removal and retained trailing decay. Relative pack/subfolder paths are
-preserved. The analyzer records physical waveform lengths and analysis extents
-separately. Dataset splits are deterministic within each pack.
+Preprocessing defaults to the highest-RMS channel, 48 kHz, and a 20-second
+maximum duration. It trims leading silence at −65 dBFS using 256-sample frames
+and keeps the trailing decay. Relative pack/subfolder paths are preserved.
+Preprocessing and modal extraction write IEEE float32 WAVs with SoundFile.
+The analyzer records physical waveform lengths and analysis extents separately.
+Dataset splits are deterministic within each pack.
 
 Parallel analysis supports CPU processes or explicitly selected CUDA devices:
 
@@ -78,6 +80,74 @@ Reconstruction requires the checkpoint's original noise bank and matching modal
 analysis configuration. Exports contain target, reconstruction and analyzed
 sinusoidal WAVs; `--branches` adds component signals. Evaluation reports per-file
 and aggregate spectral, onset, envelope and MFCC errors over valid clip lengths.
+Exports preserve waveform amplitudes in float32. The default evaluator clips
+both signals to `[-1, 1]` before scoring, as in the epoch-135 comparison.
+
+### Paired training with DrumBlender OG
+
+Use the STAMP trainer for both models. Install both packages in the same
+environment and extract both caches from the same `stamp preprocess` output.
+Use STAMP's metadata to freeze the same splits in the OG cache.
+
+```bash
+python -m pip install -e ".[train,wandb]" -e "$OG_REPO[modal]"
+stamp extract --processed_root "$PROCESSED_ROOT" --out_dir "$STAMP_CACHE" \
+  --modal_backend hybrid --num_modes 64 --seed 20261106
+python "$OG_REPO/scripts/extract_baseline_modal.py" --processed-root "$PROCESSED_ROOT" \
+  --out-dir "$OG_CACHE" --reference-metadata "$STAMP_CACHE/metadata.json" \
+  --analysis-method original --num-modes 64 --seed 20261106
+COMMON=(--data-dir "$STAMP_CACHE" --og-data-dir "$OG_CACHE" --audio-dir "$PROCESSED_ROOT"
+        --split-seed 20261106 --seed 20261106
+        --wandb-project percussion --wandb-group paired-20261106)
+stamp train "${COMMON[@]}" --noise-bank assets/noise_bank_48k.pt --output outputs/stamp
+stamp train "${COMMON[@]}" --model drumblender_og \
+  --og-config "$OG_REPO/cfg/05_all_parallel_variable.yaml" --output outputs/drumblender_og
+```
+
+Both runs share the Adam schedule, gradient clipping and CSV/W&B setup. OG
+optimizes its configured auraloss MSS on valid, unnormalized waveforms. The
+variable-length loss crops batch padding and averages independent clip losses.
+STAMP optimizes its peak-normalized spectral and envelope objective.
+`validation/og_mss` and `validation/loss` track the OG and STAMP objectives
+used for scheduling and checkpoint selection. Compare runs with
+`validation/mss`, the same per-clip auraloss MSS measured at the original
+waveform scale. For training, OG records
+`train/mss_epoch` and STAMP records `train/loss_epoch`. The step curves record
+the rank-averaged final microbatch at Lightning's logging interval.
+
+The sampler shuffles by run seed and epoch, then shards across ranks. It keeps
+complete optimizer batches, so a shuffled remainder smaller than one effective
+batch is omitted each epoch. Validation uses fixed per-clip noise and counts
+each clip once. Keep `--split-seed` fixed when varying `--seed`. For CSV-only
+logging, omit the W&B flags.
+
+Export paired checkpoints against the same processed WAV tree and evaluate both
+bundles together. Use the matching modal cache for each checkpoint.
+
+```bash
+stamp reconstruct --checkpoint "$STAMP_CKPT" --noise-bank assets/noise_bank_48k.pt \
+  --data-dir "$STAMP_CACHE" --audio-dir "$PROCESSED_ROOT" --output outputs/test/stamp
+stamp reconstruct --model drumblender_og --checkpoint "$OG_CKPT" \
+  --og-config "$OG_REPO/cfg/05_all_parallel_variable.yaml" \
+  --data-dir "$OG_CACHE" --audio-dir "$PROCESSED_ROOT" --output outputs/test/drumblender_og
+stamp evaluate outputs/test
+```
+
+For the epoch-135 comparison, use the original `processed` WAV tree, STAMP's
+`processed_modal_window_v2_64_2gpu` cache and OG's
+`drumblender_og_cqt64_original` cache. The epoch-135 run loaded WAVs from the
+STAMP cache itself. On the reference server those WAVs decode to the same
+samples as the corresponding files in `processed`.
+
+To replay the archived OG epoch-54 checkpoint, use its test cache and source
+from `eval/baseline_og_epoch054`. Its test feature tensors differ from those in
+the full OG cache, even though the waveform samples and split agree.
+
+Use `--config stamp/configs/epoch135.yaml` to carry the verified seed, device,
+batch, accumulation and optimizer settings into a new run. Paired mode uses
+the shared sampler described above. To replay the original training schedule,
+use `scripts.train_joint_resynthesis` and `cfg/joint_resynthesis.yaml` from the
+original source revision `0bec54b626b46720489668a7785bba22c028585b`.
 
 Default configurations are in [`stamp/configs`](stamp/configs). Data, weights,
 rendered audio and reports are not distributed with the package.

@@ -24,18 +24,8 @@ from stamp.metrics import (
     load_evaluation_metrics,
     score_reconstruction,
 )
+from stamp.utils.audio import read_float_wav
 from stamp.utils.device import resolve_device
-
-try:
-    import torchaudio  # type: ignore
-except Exception:
-    torchaudio = None
-
-try:
-    import soundfile as sf  # type: ignore
-except Exception:
-    sf = None
-
 
 # Number of examples shown in each best/worst report section.
 TOP_K = 3
@@ -184,23 +174,8 @@ def _safe_report_name(relpath: str) -> str:
 
 def _load_audio_mono(path: Path) -> Tuple[torch.Tensor, int]:
     """Preserve exported FLOAT amplitudes when reading the first channel."""
-    if sf is not None:
-        try:
-            # Decoder defaults can clip FLOAT reconstructions outside [-1, 1].
-            data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-            mono = torch.from_numpy(data[:, :1].T)
-            return mono, int(sr)
-        except Exception:
-            pass
-
-    if torchaudio is not None:
-        try:
-            waveform, sr = torchaudio.load(str(path))
-            return waveform[:1, :].to(torch.float32), int(sr)
-        except Exception:
-            pass
-
-    raise RuntimeError(f"Failed to read audio: {path}")
+    waveform, sample_rate = read_float_wav(path)
+    return waveform[:1], sample_rate
 
 
 def _sample_name(row: Dict[str, object]) -> str:

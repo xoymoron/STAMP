@@ -2,7 +2,7 @@
 
 import json
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import soundfile as sf
@@ -11,7 +11,9 @@ import torch
 from stamp.cli import evaluate as compile_results
 from stamp.cli import reconstruct as export_joint_resynthesis
 from stamp.cli.reconstruct import render_sinusoidal
+from stamp.loss import LengthAwareMRSTFTLoss
 from stamp.synths.modal_cycles import CyclesModalSynth
+from stamp.tasks import drumblender_og
 
 
 @pytest.mark.parametrize("empty", [False, True])
@@ -127,3 +129,66 @@ def test_joint_export_and_evaluation_include_sinusoidal_by_default(
         .split(",")
     )
     assert not {"loss", "spec", "env", "test/loss"}.intersection(columns)
+
+
+def test_og_checkpoint_exports_unclipped_float_and_uses_shared_evaluator(
+    tmp_path, monkeypatch
+):
+    class Dataset:
+        metadata = {"hit": {"orig_relpath": "Pack/hit.wav", "sample_pack_key": "Pack"}}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            yield torch.ones(1, 4096), torch.zeros(3, 1, 16), "hit"
+
+    baseline = ModuleType("drumblender.baseline")
+    baseline.BaselineDataset = Dataset
+    monkeypatch.setitem(sys.modules, "drumblender.baseline", baseline)
+
+    class Model(torch.nn.Module):
+        loss_fn = LengthAwareMRSTFTLoss()
+
+        def forward(self, target, params):
+            return 1.5 * target
+
+        def modal_synth(self, params, length):
+            return torch.zeros(1, 1, length)
+
+    model = Model()
+    monkeypatch.setattr(drumblender_og, "load_og_model", lambda _: model)
+    monkeypatch.setattr(
+        drumblender_og.DrumBlenderOGTask,
+        "load_from_checkpoint",
+        lambda *args, **kwargs: drumblender_og.DrumBlenderOGTask(
+            kwargs["model"], seed=20261106, run_seed=20261106, lr=1e-4
+        ),
+    )
+    output = tmp_path / "og"
+    export_joint_resynthesis.main(
+        [
+            "--model",
+            "drumblender_og",
+            "--og-config",
+            "og.yaml",
+            "--checkpoint",
+            "og.ckpt",
+            "--data-dir",
+            "cache",
+            "--device",
+            "cpu",
+            "--output",
+            str(output),
+        ]
+    )
+    path = next((output / "recon").glob("*.wav"))
+    samples, rate = sf.read(path, dtype="float32")
+    assert sf.info(path).subtype == "FLOAT" and rate == 48000
+    assert (samples == 1.5).all()
+    assert compile_results.main([str(output), "--device", "cpu"]) == 0
+    summary = json.loads((output / "evaluation/summary.json").read_text())
+    assert summary["metrics"]["test/log_rms_envelope"] == pytest.approx(0.0)

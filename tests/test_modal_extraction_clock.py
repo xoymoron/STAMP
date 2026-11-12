@@ -52,5 +52,6 @@ def extract(tmp_path, monkeypatch, backend, length, *options):
 def test_explicit_padding_is_saved_with_the_analysis_length(tmp_path, monkeypatch):
     output, metadata = extract(tmp_path, monkeypatch, "hybrid", 100, "--pad_to", "320")
     (item,) = metadata.values()
-    assert sf.info(output / item["filename"]).frames == 320
+    info = sf.info(output / item["filename"])
+    assert info.frames == 320 and info.subtype == "FLOAT"
     assert item["num_samples"] == item["analysis_num_samples"] == 320

@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torchaudio
 from torch.utils.data import Dataset
+
+from stamp.utils.audio import read_float_wav
 
 logging.basicConfig()
 log = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class AudioWithParametersDataset(Dataset):
         split_val_ratio: float = 0.1,
         modal_config_file: str = "modal_config.json",
         preserve_analysis_clock: bool = False,
+        strict_audio_dir: bool = False,
     ):
         super().__init__()
         if num_samples is not None and num_samples > 0:
@@ -111,6 +113,9 @@ class AudioWithParametersDataset(Dataset):
         self.sample_pack_keys = sample_pack_keys
         self.parameter_key = parameter_key
         self.audio_dir = Path(audio_dir) if audio_dir is not None else None
+        self.strict_audio_dir = strict_audio_dir
+        if strict_audio_dir and self.audio_dir is None:
+            raise ValueError("strict_audio_dir requires an explicit audio_dir.")
         self._audio_fallback_warned = False
         self.expected_num_modes = expected_num_modes
         self.split_train_ratio = split_train_ratio
@@ -224,7 +229,7 @@ class AudioWithParametersDataset(Dataset):
         item = self.metadata[key]
 
         wav_path = self._audio_path(item)
-        waveform, sr = torchaudio.load(str(wav_path))
+        waveform, sr = read_float_wav(wav_path)
         assert sr == self.sample_rate, (
             f"Sample rate mismatch: {sr} != {self.sample_rate}"
         )
@@ -296,6 +301,8 @@ class AudioWithParametersDataset(Dataset):
             )
 
     def _audio_path(self, item: dict) -> Path:
+        if self.strict_audio_dir:
+            return self.audio_dir / item["orig_relpath"]
         if self.audio_dir is not None and item.get("orig_relpath"):
             audio_path = self.audio_dir.joinpath(item["orig_relpath"])
             if audio_path.exists():

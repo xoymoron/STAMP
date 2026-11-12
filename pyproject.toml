@@ -30,6 +30,7 @@ train = [
     "pytorch-lightning==1.9.5",
     "lightning-utilities==0.8.0",
 ]
+wandb = ["wandb>=0.19,<1"]
 analysis = ["matplotlib>=3.7,<4"]
 
 [project.scripts]

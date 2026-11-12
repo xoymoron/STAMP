@@ -9,10 +9,28 @@ from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 
 from stamp.utils.device import resolve_device
+
+
+def read_float_wav(path: Path) -> tuple[torch.Tensor, int]:
+    """Decode WAV samples as float32 in channels-first order."""
+    data, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    return torch.from_numpy(data.T), sample_rate
+
+
+def write_float_wav(path: Path, waveform: torch.Tensor, sample_rate: int) -> None:
+    """Write channels-first samples as IEEE float32 WAV at their current level."""
+    sf.write(
+        path,
+        waveform.detach().cpu().float().T.numpy(),
+        sample_rate,
+        format="WAV",
+        subtype="FLOAT",
+    )
 
 
 def preprocess_audio_file(
@@ -42,7 +60,7 @@ def preprocess_audio_file(
     ``device`` (cpu, cuda, cuda:N, or auto); decoding and saving use CPU tensors.
     """
     compute_device = resolve_device(device)
-    waveform, orig_freq = torchaudio.load(str(input_file))
+    waveform, orig_freq = read_float_wav(input_file)
     assert waveform.ndim == 2, "Expecting a 2D tensor, channels x samples"
     waveform = waveform.to(compute_device)
 
@@ -94,7 +112,7 @@ def preprocess_audio_file(
             waveform = torch.nn.functional.pad(waveform, (0, num_pad))
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(output_file), waveform.cpu(), sample_rate)
+    write_float_wav(output_file, waveform, sample_rate)
 
 
 def select_highest_rms_channel(waveform: torch.Tensor) -> torch.Tensor:

@@ -7,6 +7,7 @@ import shutil
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 
 from stamp.cli import evaluate as compile_results
 from stamp.metrics import (
@@ -14,7 +15,16 @@ from stamp.metrics import (
     audio_pair_fingerprint,
     evaluation_score_keys,
     load_evaluation_metrics,
+    score_reconstruction,
 )
+
+
+def test_default_metrics_clip_at_epoch135_bounds():
+    metrics, _ = load_evaluation_metrics()
+    prediction = torch.full((1, 1, 4096), 1.5)
+    target = torch.ones_like(prediction)
+    scores = score_reconstruction(metrics, prediction, target, sample_rate=48000)
+    assert scores["test/log_rms_envelope"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("multiple_models", [False, True])
