@@ -8,7 +8,7 @@ include = ["stamp*"]
 [project]
 name = "stamp"
 version = "0.0.1"
-description = "Joint modal, noise and transient percussion reconstruction with temporal SAE control"
+description = "Joint modal, noise and transient percussion reconstruction"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [

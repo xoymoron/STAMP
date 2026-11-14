@@ -1,1 +1,1 @@
-"""Percussion reconstruction and sparse timbre control."""
+"""Percussion reconstruction."""

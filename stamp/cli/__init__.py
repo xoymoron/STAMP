@@ -13,10 +13,7 @@ COMMANDS = {
     "train": "stamp.cli.train",
     "reconstruct": "stamp.cli.reconstruct",
     "evaluate": "stamp.cli.evaluate",
-    "control": "stamp.control.cache",
-    "train-control": "stamp.cli.train_control",
-    "evaluate-control": "stamp.cli.evaluate_control",
-    "analyze-control": "stamp.cli.analyze_control",
+    "sae": "stamp.cli.sae",
 }
 
 
@@ -24,7 +21,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="stamp",
-        description="Percussion reconstruction and temporal SAE control.",
+        description="Percussion reconstruction and SAE experiments.",
     )
     parser.add_argument("command", choices=COMMANDS)
     if not argv:

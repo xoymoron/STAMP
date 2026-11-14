@@ -1,11 +1,9 @@
 # STAMP
 
-Percussion audio reconstruction and sparse timbre control in PyTorch.
+Percussion audio reconstruction in PyTorch.
 
 STAMP reconstructs variable-length, mono percussion recordings at 48 kHz using
-joint modal, noise-band and transient synthesis. A post-hoc temporal sparse
-autoencoder (SAE) learns edit directions in the frozen model's shared
-representation.
+joint modal, noise-band and transient synthesis.
 
 ## Model
 
@@ -16,10 +14,7 @@ representation.
 - A small temporal convolutional network produces a modal-conditioned transient.
 
 The reconstruction objective combines multi-resolution spectral and envelope
-losses. SAE training is separate: the reconstruction model is frozen, and paired
-SAEs share a latent-only warm-up before intervention-aware continuation.
-Controls edit the temporal representation while retaining neutral strike
-conditioning.
+losses.
 
 ## Installation
 
@@ -157,29 +152,66 @@ original source revision `0bec54b626b46720489668a7785bba22c028585b`.
 Default configurations are in [`stamp/configs`](stamp/configs). Data, weights,
 rendered audio and reports are not distributed with the package.
 
-## Temporal SAE control
+## JumpReLU SAE
+
+Train a sparse dictionary on the existing joint model's shared 256-channel
+latent. The SAE is trained from unlabeled audio on the original splits. Use
+the same checkpoint, modal cache, and noise bank as reconstruction. Install the
+`train` extra to load the frozen STAMP checkpoint during cache and rendering.
 
 ```sh
-stamp control cache --checkpoint CHECKPOINT.ckpt --noise-bank assets/noise_bank_48k.pt --data-dir data/modal --audio-dir data/processed --cache outputs/control/cache
-stamp control train --cache outputs/control/cache --output outputs/control/warmup
-stamp train-control --checkpoint CHECKPOINT.ckpt --noise-bank assets/noise_bank_48k.pt --data-dir data/modal --audio-dir data/processed --cache outputs/control/cache --warmup outputs/control/warmup/best.pt --output outputs/control/paired
+stamp sae cache --checkpoint CHECKPOINT.ckpt --data-dir data/modal --noise-bank assets/noise_bank_48k.pt --cache outputs/sae/cache
+stamp sae train --cache outputs/sae/cache --output outputs/sae/run
+stamp sae sparsity --cache outputs/sae/cache --sae outputs/sae/run/lambda-0.001/sae.pt outputs/sae/run/lambda-0.003/sae.pt outputs/sae/run/lambda-0.01/sae.pt --output outputs/sae/sparsity-val.json
+stamp sae audition --checkpoint CHECKPOINT.ckpt --data-dir data/modal --noise-bank assets/noise_bank_48k.pt --cache outputs/sae/cache --sae outputs/sae/run/lambda-0.003/sae.pt --output outputs/sae/audition
 ```
 
-The SAE uses 512 features, TopK 8 and nine-frame kernels. Calibration uses the
-training split; candidate audition uses validation. Open the generated
-`outputs/control/paired/audition/index.html` and select two feature indices before
-held-out evaluation:
+Add `--audio-dir data/processed` to the cache and render commands if the cache
+does not store the WAVs. This explicitly loads WAVs by their original relative
+paths. `--device auto` uses CUDA when available. Cache splits are written
+individually. Use `--splits val test` to complete remaining splits after a
+train-only cache run. Each cache is sized by the number of valid frames
+(1 KiB per frame) plus its index.
+
+Training draws uniform clips and weights each frame by its valid sample count.
+It uses 512 framewise features, a learned threshold per feature, and latent
+reconstruction plus an L0 penalty. The three default coefficients share the
+same initialization and 20,000-step budget. Check validation L0 and FVU,
+threshold quantiles and activation coverage before choosing the checkpoint.
+
+Open `outputs/sae/audition/index.html`. Every candidate includes high-activation
+and random hits. In a sweep, `0x` removes that feature, `1x` is neutral, and
+`1.5x` increases its original activation by half. The audition includes direct
+SAE reconstructions for checking latent fidelity separately from edit identity.
+
+Choose one or two zero-based feature IDs by listening. Substitute them for
+`FEATURE_A FEATURE_B` below. Run `compare` on validation before fixing the IDs,
+checkpoint, and any PCA-axis or sweep-gain overrides for `evaluate`.
 
 ```sh
-stamp evaluate-control --checkpoint CHECKPOINT.ckpt --noise-bank assets/noise_bank_48k.pt --data-dir data/modal --audio-dir data/processed --cache outputs/control/cache --run outputs/control/paired --output outputs/control/test --atoms ATOM_A ATOM_B
-stamp analyze-control outputs/control/test
+stamp sae compare --checkpoint CHECKPOINT.ckpt --data-dir data/modal --noise-bank assets/noise_bank_48k.pt --cache outputs/sae/cache --sae outputs/sae/run/lambda-0.003/sae.pt --features FEATURE_A FEATURE_B --output outputs/sae/compare
+stamp sae evaluate --checkpoint CHECKPOINT.ckpt --data-dir data/modal --noise-bank assets/noise_bank_48k.pt --cache outputs/sae/cache --sae outputs/sae/run/lambda-0.003/sae.pt --features FEATURE_A FEATURE_B --output outputs/sae/test
 ```
 
-Replace `ATOM_A ATOM_B` with this run's selected indices. The signed knob maps to
-`alpha(k) = sign(k) * (65**abs(k) - 1)`. Listening exports include both raw Float32
-WAVs and RMS-matched copies. Strong edits can increase output level. Input and
-source identities are recorded in each protocol; resume requires matching
-artifacts and code.
+The comparison bundles include the following.
+
+- **Transfer**. Two donors per source. SAE, dense latent, and PCA edits use
+  the same onset alignment, overlap and interpolation fractions. The PCA
+  baseline defaults to as many leading axes as selected features. Try
+  `--pca-axes` on validation to audition alternative axes.
+- **Interpolation**. A bidirectional edit and aligned waveform mix with exact
+  neutral endpoints on the padded timeline. Compare with dense bidirectional
+  edits and the same waveform crossfade.
+- **Feature sweep**. Independent edits on fixed random clips, including inactive
+  clips. Use `--sweep-gains` to choose the common set of gains.
+- **Sparsity**. The protocol records full-split L0, FVU and activation counts.
+  To report the test sparsity curve, use `stamp sae sparsity --split test`
+  with the same checkpoint list.
+
+Open the generated `index.html` for playback. Each audio group has a shared
+preview gain for headroom. Raw Float32 WAVs preserve levels and endpoints.
+`protocol.json` records selections, input IDs and asset identities.
+`renders.json` records raw levels and edit diagnostics.
 
 ## Layout
 
@@ -187,8 +219,8 @@ artifacts and code.
 stamp/
   cli/       data preparation, training, reconstruction and evaluation
   configs/   packaged training and metric defaults
-  control/   temporal SAE, interventions, calibration and offline audition
   data/      variable-length datasets and modal metadata
+  sae/       JumpReLU training and listening experiments
   models/    waveform encoder and shared reconstruction model
   synths/    modal, noise-band and transient synthesis
   tasks/     Lightning reconstruction task
